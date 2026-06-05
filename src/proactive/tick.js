@@ -4,7 +4,7 @@
 import { createProactiveStore, BACKEND_FIRE_COOLDOWN_MS } from '../store/proactiveStore.js';
 import { createOutboxStore } from '../store/outboxStore.js';
 import { createSubStore } from '../store/subStore.js';
-import { shouldFire } from './impulseEngine.js';
+import { shouldFire, shouldFireInterval } from './impulseEngine.js';
 import { runGeneration } from '../ai/aiCaller.js';
 import { dispatchPush } from '../push/pushSender.js';
 import { nowMs } from '../util/ids.js';
@@ -40,19 +40,28 @@ export async function runProactiveTick(env) {
             // 后端冷却：上次触发太近就跳过（防 1 分钟 cron 连发）
             if (rec.lastFiredAt && (now - rec.lastFiredAt) < BACKEND_FIRE_COOLDOWN_MS) continue;
 
-            const verdict = shouldFire({
-                profile: rec.proactiveProfile,
-                lifeState: rec.lifeState,
-                now,
-                lastInteractionAt: rec.lastInteractionAt || 0,
-                scheduleCtx: null, // 设备专属，后端无
-                intensity: rec.intensity || 'normal',
-                unansweredStreak: (rec.lifeState && rec.lifeState.unansweredStreak) || 0,
-                proactiveEnabledAt: rec.proactiveEnabledAt || 0,
-                proactiveBias: rec.proactiveBias || 0,
-                userActiveAt: 0, // 设备专属信号，后端默认 0
-                charUtcOffsetSeconds: rec.charUtcOffsetSeconds ?? null,
-            });
+            // 两种触发档：'impulse'(真人模式) / 'interval'(普通后台主动，计时+概率高中低)
+            let verdict;
+            if (rec.mode === 'interval') {
+                verdict = shouldFireInterval({
+                    now, lastFiredAt: rec.lastFiredAt || 0,
+                    interval: rec.interval, intervalUnit: rec.intervalUnit, probability: rec.probability,
+                });
+            } else {
+                verdict = shouldFire({
+                    profile: rec.proactiveProfile,
+                    lifeState: rec.lifeState,
+                    now,
+                    lastInteractionAt: rec.lastInteractionAt || 0,
+                    scheduleCtx: null, // 设备专属，后端无
+                    intensity: rec.intensity || 'normal',
+                    unansweredStreak: (rec.lifeState && rec.lifeState.unansweredStreak) || 0,
+                    proactiveEnabledAt: rec.proactiveEnabledAt || 0,
+                    proactiveBias: rec.proactiveBias || 0,
+                    userActiveAt: 0, // 设备专属信号，后端默认 0
+                    charUtcOffsetSeconds: rec.charUtcOffsetSeconds ?? null,
+                });
+            }
 
             if (!verdict.fire) continue;
 

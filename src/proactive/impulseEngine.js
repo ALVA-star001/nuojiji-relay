@@ -221,9 +221,38 @@ export function calculateImpulse({
 }
 
 /**
- * 便捷判定：是否应该发。返回 { fire:boolean, score, threshold, reason }。
+ * 便捷判定（真人模式 impulse 档）：是否应该发。返回 { fire:boolean, score, threshold, reason }。
  */
 export function shouldFire(ctx) {
     const r = calculateImpulse(ctx);
     return { fire: !r.hardSkip && r.score >= r.threshold, ...r };
+}
+
+// ===== 普通后台主动档（interval + 概率高/中/低）=====
+// 与 APP 的 backgroundActivityLogic.js 的 shouldCheckActivity + shouldCharacterAct 对齐。
+
+const PROB_MAP = { high: 0.99, medium: 0.7, low: 0.4 };
+
+function intervalToMs(interval, unit) {
+    const n = Number(interval) || 60;
+    switch (unit) {
+        case 'seconds': return n * 1000;
+        case 'hours': return n * 60 * 60 * 1000;
+        case 'minutes': default: return n * 60 * 1000;
+    }
+}
+
+/**
+ * 普通档触发判定：距上次触发 >= interval 且概率 roll 通过。
+ * @param {object} ctx { now, lastFiredAt, interval, intervalUnit, probability }
+ * @returns {{fire:boolean, reason:string}}
+ */
+export function shouldFireInterval({ now, lastFiredAt = 0, interval = 60, intervalUnit = 'minutes', probability = 'medium' }) {
+    const intervalMs = intervalToMs(interval, intervalUnit);
+    if (lastFiredAt && (now - lastFiredAt) < intervalMs) {
+        return { fire: false, reason: `interval not elapsed (${Math.round((now - lastFiredAt) / 60000)}m < ${Math.round(intervalMs / 60000)}m)` };
+    }
+    const threshold = PROB_MAP[probability] ?? 0.3;
+    const roll = Math.random();
+    return { fire: roll < threshold, reason: `interval roll ${roll.toFixed(2)} vs ${threshold} (${probability})` };
 }

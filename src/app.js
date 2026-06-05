@@ -193,6 +193,7 @@ export function createApp() {
             inboxId, userId, charId, promptTemplate, proactiveProfile, lifeState,
             intensity, proactiveBias, recentMessages, aiSettings, quietHours,
             charUtcOffsetSeconds, proactiveEnabledAt, lastInteractionAt, enabled,
+            mode, interval, intervalUnit, probability,
         } = body || {};
         if (!inboxId || userId == null || charId == null || !promptTemplate || !aiSettings) {
             return c.json({ error: 'inboxId / userId / charId / promptTemplate / aiSettings required' }, 400);
@@ -200,6 +201,8 @@ export function createApp() {
         const { proactive } = await getStores(c.env);
         await proactive.upsert({
             inboxId, userId: String(userId), charId: String(charId),
+            mode: mode === 'interval' ? 'interval' : 'impulse',
+            interval: interval ?? 60, intervalUnit: intervalUnit || 'minutes', probability: probability || 'medium',
             promptTemplate, proactiveProfile: proactiveProfile || null, lifeState: lifeState || {},
             intensity: intensity || 'normal', proactiveBias: proactiveBias || 0,
             recentMessages: Array.isArray(recentMessages) ? recentMessages.slice(-PROACTIVE_WINDOW_CAP) : [],
