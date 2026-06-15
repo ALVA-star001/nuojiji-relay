@@ -21,6 +21,9 @@
 export const PROACTIVE_WINDOW_CAP = 30;
 // 后端 cron 触发后的最小静默（防 1 分钟 cron 连发；与手机端冷却独立）
 export const BACKEND_FIRE_COOLDOWN_MS = 20 * 60 * 1000;
+// 生成失败后的短冷却：失败不回退到原值（否则下一分钟 cron 就重试 → API 持续报错时每分钟烧钱），
+//   也不白占满 20min（否则用户要等很久才收到下一条）。设成「失败那刻起 5min 后可再试」。
+export const BACKEND_FAIL_COOLDOWN_MS = 5 * 60 * 1000;
 
 export function makePairKey(inboxId, userId, charId) {
     return `${inboxId}:${String(userId)}:${String(charId)}`;

@@ -1,7 +1,7 @@
 // Cron tick：遍历已启用的 pair，重算 impulse，命中则实时调 AI 生成主动消息 → outbox + 推送。
 // worker.js 的 scheduled 和 server.js 的 node-cron 都调 runProactiveTick(env)。
 
-import { createProactiveStore, BACKEND_FIRE_COOLDOWN_MS, PROACTIVE_WINDOW_CAP } from '../store/proactiveStore.js';
+import { createProactiveStore, BACKEND_FIRE_COOLDOWN_MS, BACKEND_FAIL_COOLDOWN_MS, PROACTIVE_WINDOW_CAP } from '../store/proactiveStore.js';
 import { createOutboxStore } from '../store/outboxStore.js';
 import { createSubStore } from '../store/subStore.js';
 import { shouldFire, shouldFireInterval } from './impulseEngine.js';
@@ -85,6 +85,17 @@ export async function runProactiveTick(env) {
 
             if (!verdict.fire) continue;
 
+            // 🔒 先抢占发送槽：在【生成之前】就把 lastFiredAt 推进到 now 落库。
+            //    根因（重复消息真凶之一）：旧码 lastFiredAt 在生成【之后】才 patch（line ~151），
+            //    而 runGeneration 可能耗时数十秒（甚至超过 1 分钟 cron 间隔）。期间下一轮 cron 读到的
+            //    还是旧 lastFiredAt → 冷却闸（line 58）放行 → 同一对用同一份未更新的滑窗/理由【再生成一次】
+            //    → 下一轮主动消息与上一轮内容重复。Workers scheduled 无重入守卫、proactive 路径也无
+            //    requestId 幂等，两轮 cron 完全独立都会发。先抢槽后生成 = 把冷却窗口提前到生成前，
+            //    第二轮 cron 立刻被冷却闸挡住。生成失败下面会把 lastFiredAt 回退，允许下轮正常重试。
+            const claimOk = await proactive.patch(rec.inboxId, rec.userId, rec.charId, { lastFiredAt: now });
+            // patch 失败（pair 已被删/未注册）→ 跳过，别在没占到槽的情况下空生成扣费。
+            if (!claimOk) continue;
+
             // 命中 → 实时生成。messages 只有一条 system（手机端拼好的完整 prompt + 填充滑窗）
             const transcript = renderTranscript(rec.recentMessages);
             // 🧠 直连第三方记忆 MCP 检索（关软件也能用最新记忆）；失败/无配置 → 空串不阻断生成。
@@ -117,6 +128,17 @@ export async function runProactiveTick(env) {
                 error = String(e?.message || e);
             }
 
+            // 生成失败：设「短冷却」而非回退到原值或白占满 20min。
+            //    把 lastFiredAt 设成 now-(20min-5min) → 冷却闸算出来还剩 5min 就放行。
+            //    既不会 API 持续报错时每分钟 cron 重试烧钱，又不让用户等满 20min 才收到下一条。
+            //    失败不入 outbox（手机端对 error item 一律丢弃）、不发推送、不推进 lifeState/streak。
+            if (error) {
+                const failMark = now - (BACKEND_FIRE_COOLDOWN_MS - BACKEND_FAIL_COOLDOWN_MS);
+                await proactive.patch(rec.inboxId, rec.userId, rec.charId, { lastFiredAt: failMark });
+                console.warn('[proactive] generation failed, short cooldown 5min:', error);
+                continue;
+            }
+
             const requestId = `proactive_${rec.userId}_${rec.charId}_${now}`;
             const item = {
                 id: `relay_${requestId}`, requestId,
@@ -131,7 +153,7 @@ export async function runProactiveTick(env) {
             //    手机端排水后会异步 sync 覆盖这份（带完整字段），这里只是保证「自己发的」立刻进上下文。
             //    用 extractPushBodies 拆成每个气泡一条（与推送/手机端入库口径一致，过滤隐藏类型）。
             let nextWindow = Array.isArray(rec.recentMessages) ? rec.recentMessages : [];
-            if (!error && content) {
+            if (content) {
                 const selfBubbles = extractPushBodies(content)
                     .filter(b => b && b !== '有新消息' && b !== '有新消息，点开查看')
                     .map(text => ({ sender: 'char', text }));
@@ -141,15 +163,15 @@ export async function runProactiveTick(env) {
             }
 
             // 简单更新后端 lifeState（完整 evolve 仍在手机端，下次 sync 覆盖）
+            // lastFiredAt 已在生成前抢占落库，这里不再重复设。
             const ls = rec.lifeState || {};
             // 📈 自增「连续未回复」：后端自己发了一条而 user 没回（user 回了的话手机端 sync 会把
             //    streak 清 0 并覆盖整份 lifeState）。streak 是真人模式防轰炸的核心闸门
             //    （>=streakHardCap 硬跳过 + 每级降低 impulse 分），后端不自增 → 闸门永远失效 →
             //    user 一直不回时反复主动 = 重复消息。仅 impulse 模式自增（interval 模式不看 streak）。
             const prevStreak = (ls.unansweredStreak || 0);
-            const nextStreak = (rec.mode === 'interval' || error) ? prevStreak : prevStreak + 1;
+            const nextStreak = (rec.mode === 'interval') ? prevStreak : prevStreak + 1;
             await proactive.patch(rec.inboxId, rec.userId, rec.charId, {
-                lastFiredAt: now,
                 lifeState: { ...ls, lastImpulseAt: now, lastProactiveSentAt: now, unansweredStreak: nextStreak },
                 recentMessages: nextWindow,
                 // 🕒 自己刚发完 → lastInteractionAt 也推进到现在，否则「距上次多久」一直从旧时间算，
@@ -159,14 +181,16 @@ export async function runProactiveTick(env) {
 
             // 发推送叫醒——像微信那样【逐条气泡分开弹 + 带消息内容 + 角色名标题】，
             // 与 /generate 路径一致（extractPushBodies 把 AI 的 JSON-Lines 拆成每个气泡一条文本）。
-            try {
+            // ⚠️ 生成失败（502 等）不发推送：手机端排水对 error item 一律丢弃不写气泡，
+            //    若仍弹通知 → 用户点进聊天却没有消息 = 假通知。失败静默，等下次 tick 重试。
+            if (!error) try {
                 const subs = await sub.list(rec.inboxId);
                 if (subs.length) {
                     const title = rec.timeSpec?.charName || '糯叽机';
                     // 🔒 通知隐私模式：正文换「你有一条新消息」，标题(角色名)/头像保留。仍逐气泡发以保持节奏一致。
                     const bodies = rec.notifPrivacy
-                        ? (error ? ['你有一条新消息'] : extractPushBodies(content).map(() => '你有一条新消息'))
-                        : (error ? ['有新消息，点开查看'] : extractPushBodies(content));
+                        ? extractPushBodies(content).map(() => '你有一条新消息')
+                        : extractPushBodies(content);
                     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
                     let i = 0;
                     for (const body of bodies) {
